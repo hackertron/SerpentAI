@@ -9,21 +9,32 @@ except(IOError, ImportError):
 
 packages = [
     "serpent",
+    "serpent.dashboard",
+    "serpent.dashboard.cefbrowser",
+    "serpent.dashboard.models",
     "serpent.game_agents",
     "serpent.game_launchers",
     "serpent.games",
     "serpent.input_controllers",
+    "serpent.loggers",
     "serpent.machine_learning",
     "serpent.machine_learning.context_classification",
     "serpent.machine_learning.context_classification.context_classifiers",
     "serpent.machine_learning.reinforcement_learning",
     "serpent.machine_learning.reinforcement_learning.agents",
+    "serpent.machine_learning.reinforcement_learning.rainbow_dqn",
+    "serpent.machine_learning.reinforcement_learning.ppo",
+    "serpent.machine_learning.object_recognition",
+    "serpent.machine_learning.object_recognition.object_recognizers",
     "serpent.visual_debugger",
     "serpent.wamp_components",
     "serpent.window_controllers"
 ]
 
 data_files = [
+    ("serpent/dashboard/cefbrowser", [
+        "serpent/dashboard/cefbrowser/cefbrowser.kv"
+    ]),
     ("serpent/templates/SerpentGameAgentPlugin", [
         "serpent/templates/SerpentGameAgentPlugin/plugin.py",
         "serpent/templates/SerpentGameAgentPlugin/__init__.py",
@@ -65,8 +76,13 @@ data_files = [
         "serpent/offshoot.yml",
         "serpent/requirements.linux.txt",
         "serpent/requirements.win32.txt",
-        "serpent/requirements.darwin.txt"
-    ])
+        "serpent/requirements.darwin.txt",
+        "serpent/crossbar.json"
+    ]),
+    ("dashboard", [
+        "dashboard/database.sqlite",
+        "dashboard/serpent.png"
+    ]),
 ]
 
 requires = [

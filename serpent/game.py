@@ -23,7 +23,7 @@ from serpent.game_frame_limiter import GameFrameLimiter
 
 from serpent.sprite import Sprite
 
-from serpent.utilities import clear_terminal, is_windows
+from serpent.utilities import clear_terminal, is_windows, SerpentError
 
 import skimage.io
 import skimage.color
@@ -47,12 +47,14 @@ class Game(offshoot.Pluggable):
 
         self.platform = kwargs.get("platform")
 
-        default_input_controller_backend = InputControllers.NATIVE_WIN32 if is_windows() else InputControllers.PYAUTOGUI
+        default_input_controller_backend = InputControllers.CLIENT
         self.input_controller = kwargs.get("input_controller") or default_input_controller_backend
 
         self.window_id = None
         self.window_name = kwargs.get("window_name")
         self.window_geometry = None
+
+        self.dashboard_window_id = None
 
         self.window_controller = WindowController()
 
@@ -60,6 +62,9 @@ class Game(offshoot.Pluggable):
 
         self.frame_grabber_process = None
         self.frame_transformation_pipeline_string = None
+
+        self.crossbar_process = None
+        self.input_controller_process = None
 
         self.game_frame_limiter = GameFrameLimiter(fps=self.config.get("fps", 30))
 
@@ -72,6 +77,8 @@ class Game(offshoot.Pluggable):
         self.sprites = self._discover_sprites()
 
         self.redis_client = StrictRedis(**config["redis"])
+
+        self.pause_callback_fired = False
 
         self.kwargs = kwargs
 
@@ -156,11 +163,29 @@ class Game(offshoot.Pluggable):
     def after_launch(self):
         self.is_launched = True
 
-        time.sleep(5)
+        current_attempt = 1
 
-        self.window_id = self.window_controller.locate_window(self.window_name)
+        while current_attempt <= 100:
+            self.window_id = self.window_controller.locate_window(self.window_name)
+
+            if self.window_id not in [0, "0"]:
+                break
+
+            time.sleep(0.1)
+
+        time.sleep(3)
+
+        if self.window_id in [0, "0"]:
+            raise SerpentError("Game window not found...")
 
         self.window_controller.move_window(self.window_id, 0, 0)
+
+        self.dashboard_window_id = self.window_controller.locate_window("Serpent.AI Dashboard")
+
+        # TODO: Test on macOS and Linux
+        if self.dashboard_window_id is not None and self.dashboard_window_id not in [0, "0"]:
+            self.window_controller.bring_window_to_top(self.dashboard_window_id)
+
         self.window_controller.focus_window(self.window_id)
 
         self.window_geometry = self.extract_window_geometry()
@@ -170,6 +195,11 @@ class Game(offshoot.Pluggable):
     def play(self, game_agent_class_name="GameAgent", frame_handler=None, **kwargs):
         if not self.is_launched:
             raise GameError(f"Game '{self.__class__.__name__}' is not running...")
+
+        self.start_crossbar()
+        time.sleep(3)
+
+        self.start_input_controller()
 
         game_agent_class = offshoot.discover("GameAgent", selection=game_agent_class_name).get(game_agent_class_name, GameAgent)
 
@@ -197,18 +227,6 @@ class Game(offshoot.Pluggable):
 
         self.window_controller.focus_window(self.window_id)
 
-        frame_type = "FULL"
-
-        pipeline_frame_handlers = [
-            "COLLECT_FRAMES", 
-            "COLLECT_FRAME_REGIONS", 
-            "COLLECT_FRAMES_FOR_CONTEXT", 
-            "RECORD"
-        ]
-
-        if frame_handler in pipeline_frame_handlers and self.frame_transformation_pipeline_string is not None:
-            frame_type = "PIPELINE"
-
         # Override FPS Config?
         if frame_handler == "RECORD":
             self.game_frame_limiter = GameFrameLimiter(fps=10)
@@ -217,16 +235,18 @@ class Game(offshoot.Pluggable):
             while True:
                 self.game_frame_limiter.start()
 
-                game_frame = self.grab_latest_frame(frame_type=frame_type)
+                game_frame, game_frame_pipeline = self.grab_latest_frame()
 
                 try:
                     if self.is_focused:
-                        game_agent.on_game_frame(game_frame, frame_handler=frame_handler, **kwargs)
+                        self.pause_callback_fired = False
+                        game_agent.on_game_frame(game_frame, game_frame_pipeline, frame_handler=frame_handler, **kwargs)
                     else:
-                        clear_terminal()
-                        print("PAUSED\n")
+                        if not self.pause_callback_fired:
+                            print("PAUSED\n")
 
-                        game_agent.on_pause(frame_handler=frame_handler, **kwargs)
+                            game_agent.on_pause(frame_handler=frame_handler, **kwargs)
+                            self.pause_callback_fired = True
 
                         time.sleep(1)
                 except Exception as e:
@@ -235,9 +255,13 @@ class Game(offshoot.Pluggable):
                     # time.sleep(0.1)
 
                 self.game_frame_limiter.stop_and_delay()
+        except Exception as e:
+            raise e
         finally:
             self.stop_frame_grabber()
-
+            self.stop_input_controller()
+            self.stop_crossbar()
+            
     @offshoot.forbidden
     def extract_window_geometry(self):
         if self.is_launched:
@@ -262,10 +286,10 @@ class Game(offshoot.Pluggable):
 
         self.frame_grabber_process = subprocess.Popen(shlex.split(frame_grabber_command))
 
-        signal.signal(signal.SIGINT, self._handle_signal)
-        signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGINT, self._handle_signal_frame_grabber)
+        signal.signal(signal.SIGTERM, self._handle_signal_frame_grabber)
 
-        atexit.register(self._handle_signal, 15, None, False)
+        atexit.register(self._handle_signal_frame_grabber, 15, None, False)
 
     @offshoot.forbidden
     def stop_frame_grabber(self):
@@ -275,13 +299,63 @@ class Game(offshoot.Pluggable):
         self.frame_grabber_process.kill()
         self.frame_grabber_process = None
 
-        atexit.unregister(self._handle_signal)
+        atexit.unregister(self._handle_signal_frame_grabber)
 
     @offshoot.forbidden
-    def grab_latest_frame(self, frame_type="FULL"):
-        game_frame_buffer = FrameGrabber.get_frames([0], frame_type=frame_type)
+    def grab_latest_frame(self):
+        game_frame_buffer, game_frame_buffer_pipeline = FrameGrabber.get_frames_with_pipeline([0])
 
-        return game_frame_buffer.frames[0]
+        return game_frame_buffer.frames[0], game_frame_buffer_pipeline.frames[0]
+
+    @offshoot.forbidden
+    def start_crossbar(self):
+        if self.crossbar_process is not None:
+            self.stop_crossbar()
+
+        crossbar_command = f"crossbar start --config crossbar.json"
+
+        self.crossbar_process = subprocess.Popen(shlex.split(crossbar_command))
+
+        signal.signal(signal.SIGINT, self._handle_signal_crossbar)
+        signal.signal(signal.SIGTERM, self._handle_signal_crossbar)
+
+        atexit.register(self._handle_signal_crossbar, 15, None, False)
+
+    @offshoot.forbidden
+    def stop_crossbar(self):
+        if self.crossbar_process is None:
+            return None
+
+        self.crossbar_process.kill()
+        self.crossbar_process = None
+
+        atexit.unregister(self._handle_signal_crossbar)
+
+    @offshoot.forbidden
+    def start_input_controller(self):
+        if self.input_controller_process is not None:
+            self.stop_input_controller()
+
+        self.redis_client.set("SERPENT:GAME", self.__class__.__name__)
+
+        input_controller_command = f"python -m serpent.wamp_components.input_controller_component"
+
+        self.input_controller_process = subprocess.Popen(shlex.split(input_controller_command))
+
+        signal.signal(signal.SIGINT, self._handle_signal_input_controller)
+        signal.signal(signal.SIGTERM, self._handle_signal_input_controller)
+
+        atexit.register(self._handle_signal_input_controller, 15, None, False)
+
+    @offshoot.forbidden
+    def stop_input_controller(self):
+        if self.input_controller_process is None:
+            return None
+
+        self.input_controller_process.kill()
+        self.input_controller_process = None
+
+        atexit.unregister(self._handle_signal_input_controller)
 
     def _discover_sprites(self):
         plugin_path = offshoot.config["file_paths"]["plugins"]
@@ -307,10 +381,26 @@ class Game(offshoot.Pluggable):
 
         return sprites
 
-    def _handle_signal(self, signum=15, frame=None, do_exit=True):
+    def _handle_signal_frame_grabber(self, signum=15, frame=None, do_exit=True):
         if self.frame_grabber_process is not None:
             if self.frame_grabber_process.poll() is None:
                 self.frame_grabber_process.send_signal(signum)
+
+                if do_exit:
+                    exit()
+
+    def _handle_signal_crossbar(self, signum=15, frame=None, do_exit=True):
+        if self.crossbar_process is not None:
+            if self.crossbar_process.poll() is None:
+                self.crossbar_process.send_signal(signum)
+
+                if do_exit:
+                    exit()
+
+    def _handle_signal_input_controller(self, signum=15, frame=None, do_exit=True):
+        if self.input_controller_process is not None:
+            if self.input_controller_process.poll() is None:
+                self.input_controller_process.send_signal(signum)
 
                 if do_exit:
                     exit()

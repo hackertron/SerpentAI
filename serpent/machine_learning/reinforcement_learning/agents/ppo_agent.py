@@ -5,16 +5,31 @@ from serpent.game_frame_buffer import GameFrameBuffer
 
 from serpent.enums import InputControlTypes
 
+from serpent.logger import Loggers
+
 from serpent.utilities import SerpentError
 
 import os
+import enum
+import copy
+import json
 
 import numpy as np
 
 try:
-    from tensorforce.agents import PPOAgent as TFPPOAgent  # Currently matching the API of tensorforce 0.3.5.1
+    import torch
+
+    from serpent.machine_learning.reinforcement_learning.ppo.policy import Policy
+    from serpent.machine_learning.reinforcement_learning.ppo.ppo import PPO
+    from serpent.machine_learning.reinforcement_learning.ppo.rollout_storage import RolloutStorage
 except ImportError:
     raise SerpentError("Setup has not been been performed for the ML module. Please run 'serpent setup ml'")
+
+
+class PPOAgentModes(enum.Enum):
+    OBSERVE = 0
+    TRAIN = 1
+    EVALUATE = 2
 
 
 class PPOAgent(Agent):
@@ -24,116 +39,146 @@ class PPOAgent(Agent):
         name,
         game_inputs=None,
         callbacks=None,
+        seed=420133769,
         input_shape=None,
-        input_type=None,
-        use_tensorboard=True,
-        tensorforce_kwargs=None
+        ppo_kwargs=None,
+        logger=Loggers.NOOP,
+        logger_kwargs=None
     ):
-        super().__init__(name, game_inputs=game_inputs, callbacks=callbacks)
-
-        if input_shape is None or not isinstance(input_shape, tuple):
-            raise SerpentError("'input_shape' should be a tuple...")
-
-        if input_type is None or input_type not in ["bool", "int", "float"]:
-            raise SerpentError("'input_type' should be one of bool|int|float...")
-
-        states_spec = {"type": input_type, "shape": input_shape}
-
-        actions_spec = self._generate_actions_spec()
-
-        summary_spec = None
-
-        if use_tensorboard:
-            summary_spec = {
-                "directory": "./tensorboard/",
-                "steps": 50,
-                "labels": [
-                    "configuration",
-                    "gradients_scalar",
-                    "regularization",
-                    "inputs",
-                    "losses",
-                    "variables"
-                ]
-            }
-
-        default_network_spec = [
-            {"type": "conv2d", "size": 32, "window": 8, "stride": 4},
-            {"type": "conv2d", "size": 64, "window": 4, "stride": 2},
-            {"type": "conv2d", "size": 64, "window": 3, "stride": 1},
-            {"type": "flatten"},
-            {"type": "dense", "size": 1024}
-        ]
-
-        agent_kwargs = dict(
-            batch_size=1024,
-            batched_observe=1024,
-            network_spec=default_network_spec,
-            device=None,
-            session_config=None,
-            saver_spec=None,
-            distributed_spec=None,
-            discount=0.99,
-            variable_noise=None,
-            states_preprocessing_spec=None,
-            explorations_spec=None,
-            reward_preprocessing_spec=None,
-            distributions_spec=None,
-            entropy_regularization=0.01,
-            keep_last_timestep=True,
-            baseline_mode=None,
-            baseline=None,
-            baseline_optimizer=None,
-            gae_lambda=None,
-            likelihood_ratio_clipping=None,
-            step_optimizer=None,
-            optimization_steps=10
+        super().__init__(
+            name, 
+            game_inputs=game_inputs, 
+            callbacks=callbacks, 
+            seed=seed,
+            logger=logger,
+            logger_kwargs=logger_kwargs
         )
 
-        if isinstance(tensorforce_kwargs, dict):
-            for key, value in tensorforce_kwargs.items():
+        if len(game_inputs) > 1:
+            raise SerpentError("PPOAgent only supports a single axis of game inputs.")
+
+        if game_inputs[0]["control_type"] != InputControlTypes.DISCRETE:
+            raise SerpentError("PPOAgent only supports discrete input spaces")
+
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+
+            torch.set_default_tensor_type("torch.cuda.FloatTensor")
+            torch.backends.cudnn.benchmark = True
+
+            torch.cuda.manual_seed_all(seed)
+        else:
+            self.device = torch.device("cpu")
+            torch.set_num_threads(1)
+
+        torch.manual_seed(seed)
+
+        agent_kwargs = dict(
+            algorithm="PPO",
+            is_recurrent=False,
+            surrogate_objective_clip=0.2,
+            epochs=4,
+            batch_size=32,
+            value_loss_coefficient=0.5,
+            entropy_regularization_coefficient=0.01,
+            learning_rate=0.0001,
+            adam_epsilon=0.00001,
+            max_grad_norm=0.3,
+            memory_capacity=1024,
+            discount=0.99,
+            gae=False,
+            gae_tau=0.95,
+            save_steps=10000,
+            model=f"datasets/ppo_{self.name}.pth",
+            seed=seed
+        )
+
+        if isinstance(ppo_kwargs, dict):
+            for key, value in ppo_kwargs.items():
                 if key in agent_kwargs:
                     agent_kwargs[key] = value
 
-        self.agent = TFPPOAgent(
-            states_spec=states_spec,
-            actions_spec=actions_spec,
-            summary_spec=summary_spec,
-            scope="ppo",
-            **agent_kwargs
+        self.discount = agent_kwargs["discount"]
+        
+        self.gae = agent_kwargs["gae"]
+        self.gae_tau = agent_kwargs["gae_tau"]
+
+        input_shape = (4, input_shape[0], input_shape[1]) # 4x Grayscale OR Quantized
+
+        self.actor_critic = Policy(input_shape, len(self.game_inputs[0]["inputs"]), agent_kwargs["is_recurrent"])
+
+        if torch.cuda.is_available():
+            self.actor_critic.cuda(device=self.device)
+
+        self.agent = PPO(
+            self.actor_critic,
+            agent_kwargs["surrogate_objective_clip"],
+            agent_kwargs["epochs"],
+            agent_kwargs["batch_size"],
+            agent_kwargs["value_loss_coefficient"],
+            agent_kwargs["entropy_regularization_coefficient"],
+            lr=agent_kwargs["learning_rate"],
+            eps=agent_kwargs["adam_epsilon"],
+            max_grad_norm=agent_kwargs["max_grad_norm"]
         )
 
-        try:
+        self.storage = RolloutStorage(
+            agent_kwargs["memory_capacity"],
+            1,
+            input_shape,
+            len(self.game_inputs[0]["inputs"]),
+            self.actor_critic.state_size
+        )
+
+        if torch.cuda.is_available():
+            self.storage.cuda(device=self.device)
+
+        self.current_episode = 1
+        self.current_step = 0
+
+        self.mode = PPOAgentModes.TRAIN
+        
+        self.save_steps = agent_kwargs["save_steps"]
+
+        self.model_path = agent_kwargs["model"]
+
+        if os.path.isfile(self.model_path):
             self.restore_model()
-        except Exception:
-            pass
+
+        self.logger.log_hyperparams(agent_kwargs)
 
     def generate_actions(self, state, **kwargs):
-        if isinstance(state, GameFrame):
-            self.current_state = state.frame
-        elif isinstance(state, GameFrameBuffer):
-            self.current_state = np.stack(
-                [game_frame.frame for game_frame in state.frames],
-                axis=2
-            )
-        else:
-            self.current_state = state
+        frames = list()
 
-        agent_actions = self.agent.act(self.current_state)
+        for game_frame in state.frames:
+            frames.append(torch.tensor(torch.from_numpy(game_frame.frame), dtype=torch.float32))
+
+        self.current_state = torch.stack(frames, 0)
+        self.current_state = self.current_state[None, :]
+
+        with torch.no_grad():
+            self.current_value, self.current_action, self.current_action_log_prob, self.current_states = self.actor_critic.act(
+                self.current_state, 
+                self.storage.states[self.storage.step], 
+                self.storage.masks[self.storage.step]
+            )
+
         actions = list()
 
-        for index, game_inputs_item in enumerate(self.game_inputs):
-            if game_inputs_item["control_type"] == InputControlTypes.DISCRETE:
-                label = self.game_inputs_mappings[index][agent_actions[game_inputs_item["name"]]]
-                action = game_inputs_item["inputs"][label]
+        label = self.game_inputs_mappings[0][int(self.current_action[0])]
+        action = self.game_inputs[0]["inputs"][label]
 
-                actions.append((label, action, None))
-            elif game_inputs_item["control_type"] == InputControlTypes.CONTINUOUS:
-                label = game_inputs_item["name"]
-                action = game_inputs_item["inputs"]["events"]
-                input_value = float(agent_actions[label])
+        actions.append((label, action, None))
 
-            actions.append((label, action, input_value))
+        for action in actions:
+            self.analytics_client.track(
+                event_key="AGENT_ACTION",
+                data={
+                    "label": action[0],
+                    "action": [str(a) for a in action[1]],
+                    "input_value": action[2]
+                }
+            )
 
         return actions
 
@@ -144,50 +189,103 @@ class PPOAgent(Agent):
         if self.callbacks.get("before_observe") is not None:
             self.callbacks["before_observe"]()
 
-        will_update = self.agent.batch_count == self.agent.batch_size - 1
+        rewards = torch.from_numpy(np.expand_dims(np.stack([reward]), 1)).float()
+        masks = torch.tensor([0.0] if terminal else [1.0], dtype=torch.float32)
 
-        if will_update:
+        self.current_state *= masks[0]
+
+        self.storage.insert(
+            self.current_state, 
+            self.current_states, 
+            self.current_action, 
+            self.current_action_log_prob, 
+            self.current_value, 
+            rewards,
+            masks
+        )
+
+        if terminal:
+            self.current_episode += 1
+
+        self.current_step += 1
+
+        if self.storage.step == (self.storage.num_steps - 1):
             if self.callbacks.get("before_update") is not None:
                 self.callbacks["before_update"]()
 
-            self.agent.observe(reward=reward, terminal=terminal)
+            with torch.no_grad():
+                next_value = self.actor_critic.get_value(self.storage.observations[-1], self.storage.states[-1], self.storage.masks[-1]).detach()
+
+            self.storage.compute_returns(next_value, self.gae, self.discount, self.gae_tau)
+
+            value_loss, action_loss, entropy = self.agent.update(self.storage)
+            self.analytics_client.track(event_key="PPO_INTERNALS", data={"value_loss": value_loss, "action_loss": action_loss, "entropy": entropy})
+            
+            self.logger.log_metric("entropy", entropy, step=self.current_step)
+            self.logger.log_metric("value_loss", value_loss, step=self.current_step)
+            self.logger.log_metric("action_loss", action_loss, step=self.current_step)
+
+            self.storage.after_update()
+
+            if self.callbacks.get("after_update") is not None:
+                self.callbacks["after_update"]()
+
+        if self.current_step % self.save_steps == 0:
+            if self.callbacks.get("before_update") is not None:
+                self.callbacks["before_update"]()
+
             self.save_model()
 
             if self.callbacks.get("after_update") is not None:
                 self.callbacks["after_update"]()
-        else:
-            self.agent.observe(reward=reward, terminal=terminal)
 
         self.current_state = None
 
         self.current_reward = reward
         self.cumulative_reward += reward
 
-        self.analytics_client.track(event_key="REWARD", data={"reward": self.current_reward})
+        self.analytics_client.track(event_key="REWARD", data={"reward": self.current_reward, "total_reward": self.cumulative_reward})
 
         if terminal:
             self.analytics_client.track(event_key="TOTAL_REWARD", data={"reward": self.cumulative_reward})
+            self.logger.log_metric("episode_rewards", self.cumulative_reward, step=self.current_step)
 
         if self.callbacks.get("after_observe") is not None:
             self.callbacks["after_observe"]()
 
+
     def save_model(self):
-        self.agent.save_model(directory=os.path.join(os.getcwd(), "datasets", self.name, self.name), append_timestep=False)
+        model = self.actor_critic
+        
+        if torch.cuda.is_available():
+            model = copy.deepcopy(self.actor_critic).cpu()
+
+        torch.save(model, self.model_path)
+
+        with open(self.model_path.replace(".pth", ".json"), "w") as f:
+            data = {
+                "current_episode": self.current_episode,
+                "current_step": self.current_step
+            }
+
+            f.write(json.dumps(data))
 
     def restore_model(self):
-        self.agent.restore_model(directory=os.path.join(os.getcwd(), "datasets", self.name))
+        if not os.path.isfile(self.model_path):
+            return
 
-    def _generate_actions_spec(self):
-        actions_spec = dict()
+        self.actor_critic = torch.load(self.model_path)
 
-        for game_inputs_item in self.game_inputs:
-            if game_inputs_item["control_type"] == InputControlTypes.DISCRETE:
-                actions_spec[game_inputs_item["name"]] = dict(type="int", num_actions=len(game_inputs_item["inputs"]))
-            elif game_inputs_item["control_type"] == InputControlTypes.CONTINUOUS:
-                actions_spec[game_inputs_item["name"]] = dict(
-                    type="float",
-                    min_value=game_inputs_item["inputs"]["minimum"],
-                    max_value=game_inputs_item["inputs"]["maximum"]
-                )
+        if torch.cuda.is_available():
+            self.actor_critic = self.actor_critic.cuda(device=self.device)
 
-        return actions_spec
+        file_path = self.model_path.replace(".pth", ".json")
+
+        if os.path.isfile(file_path):
+            with open(file_path, "r") as f:
+                data = json.loads(f.read())
+
+            self.current_episode = data["current_episode"]
+            self.current_step = data["current_step"]
+
+        self.emit_persisted_events()

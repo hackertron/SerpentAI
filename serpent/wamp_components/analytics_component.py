@@ -15,9 +15,9 @@ class AnalyticsComponent:
     def run(cls):
         print(f"Starting {cls.__name__}...")
 
-        url = "ws://%s:%s" % (config["analytics"]["host"], config["analytics"]["port"])
+        url = "ws://%s:%s" % (config["crossbar"]["host"], config["crossbar"]["port"])
 
-        runner = ApplicationRunner(url=url, realm=config["analytics"]["realm"])
+        runner = ApplicationRunner(url=url, realm=config["crossbar"]["realm"])
         runner.run(AnalyticsWAMPComponent)
 
 
@@ -26,30 +26,41 @@ class AnalyticsWAMPComponent(ApplicationSession):
         super().__init__(c)
 
     def onConnect(self):
-        self.join(config["analytics"]["realm"], ["wampcra"], config["analytics"]["auth"]["username"])
+        self.join(config["crossbar"]["realm"], ["wampcra"], config["crossbar"]["auth"]["username"])
 
     def onDisconnect(self):
         print("Disconnected from Crossbar!")
 
     def onChallenge(self, challenge):
-        secret = config["analytics"]["auth"]["password"]
+        secret = config["crossbar"]["auth"]["password"]
         signature = auth.compute_wcs(secret.encode('utf8'), challenge.extra['challenge'].encode('utf8'))
 
         return signature.decode('ascii')
 
     async def onJoin(self, details):
         self.redis_client = await self._initialize_redis_client()
+        self.log_file = open(f"{config['analytics']['topic']}.json", "a")
+
+        await self.redis_client.delete(f"SERPENT:{config['analytics']['topic']}:EVENTS")
 
         while True:
             redis_key, event = await self.redis_client.brpop(f"SERPENT:{config['analytics']['topic']}:EVENTS")
-            event = json.loads(event.decode("utf-8"))
 
-            topic = event.pop("project_key")
-            self.publish(topic, event)
-            print(event)
+            event = event.decode("utf-8")
+            event_parsed = json.loads(event)
+
+            if event_parsed["event_key"] in config["analytics"]["persisted_events"] and event_parsed["is_persistable"]:
+                self.log_file.write(f"{event}\n")
+                self.log_file.flush()
+
+            topic = event_parsed.pop("project_key")
+            self.publish(topic, event_parsed)
 
     async def _initialize_redis_client(self):
         return await aioredis.create_redis(
             (config["redis"]["host"], config["redis"]["port"]),
             loop=asyncio.get_event_loop()
         )
+
+if __name__ == "__main__":
+    AnalyticsComponent.run()

@@ -1,5 +1,7 @@
 import sys
 import subprocess
+import socket
+import time
 
 import enum
 
@@ -87,6 +89,21 @@ def display_serpent_logo():
 888888888888888888888888888888888888888888888888888888888888
 888888888888888888888888888888888888888888888888888888888888
     """)
+
+
+def wait_for_crossbar():
+    from serpent.config import config
+
+    while True:
+        s = socket.socket()
+
+        try:
+            s.connect((config["crossbar"]["host"], config["crossbar"]["port"]))
+            s.close()
+            break
+        except Exception:
+            print("Waiting for Crossbar server...")
+            time.sleep(0.1)
 
 
 class Singleton(type):

@@ -22,13 +22,17 @@ class FrameTransformer:
         return skimage.util.img_as_ubyte(skimage.transform.rescale(frame, float(scale)))
 
     @staticmethod
+    def crop(frame, y0, x0, y1, x1):
+        return frame[int(y0):int(y1), int(x0):int(x1), :]
+
+    @staticmethod
     def grayscale(frame):
         return skimage.util.img_as_ubyte(skimage.color.rgb2gray(frame))
 
     @staticmethod
     def to_float(frame):
         return skimage.util.img_as_float(frame)
-    
+
     @staticmethod
     def to_png(frame):
         pil_frame = Image.fromarray(skimage.util.img_as_ubyte(frame))
